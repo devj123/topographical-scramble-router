@@ -215,21 +215,48 @@ class AStarRouter:
         if not (0 <= r < self.rows and 0 <= c < self.cols and self.valid[r, c]):
             raise ValueError(f"{name} must be a valid raster cell")
 
-    def _set_vertex(self, node, parent, cost) -> bool:
-        """Apply verified, deferred any-angle shortcuts from a node's ancestry."""
-        best_parent, best_cost = parent[node], cost[node]
-        ancestor = parent[node]
-        # Normal relaxation records a consistent grid-edge parent/cost pair. At
-        # pop-time we may replace it only with an actual, fully costed LOS path.
-        while ancestor != parent[ancestor]:
-            ancestor = parent[ancestor]
-            line = self._line_cost(ancestor, node)
-            candidate = cost[ancestor] + line
-            if math.isfinite(line) and candidate <= best_cost + 1e-9:
-                best_parent, best_cost = ancestor, candidate
+    def _set_vertex(self, node, parent, cost, closed) -> bool:
+        """Canonical one-parent lazy validation at pop-time.
+
+        Ordinary relaxation records a fully consistent grid-edge parent/cost
+        pair. This method performs one LOS validation to that parent. If the
+        assumed connection is unavailable, it repairs the node through the
+        cheapest already-closed grid neighbor.
+        """
+        assigned_parent = parent[node]
+        if math.isfinite(self._line_cost(assigned_parent, node)):
+            return False
+        candidates = ((cost[neighbor] + self._edge_cost(neighbor, node), neighbor)
+                      for dr, dc in self.steps
+                      if (neighbor := (node[0] + dr, node[1] + dc)) in closed)
+        best_cost, best_parent = min(candidates, default=(math.inf, node))
         changed = not math.isclose(best_cost, cost[node], rel_tol=1e-12, abs_tol=1e-9)
         cost[node], parent[node] = best_cost, best_parent
         return changed
+
+    def _smooth_path(self, path: list[tuple[int, int]]) -> tuple[list[tuple[int, int]], float]:
+        """Greedily smooth a completed path without adding work to the search loop.
+
+        A shortcut is used only when it is traversable and no more expensive than
+        the grid subpath it replaces. This leaves A*'s parent/cost bookkeeping
+        exact while producing an any-angle, non-worsening display/export route.
+        """
+        if len(path) < 3:
+            return path, sum(self._line_cost(a, b) for a, b in zip(path, path[1:]))
+        prefix = [0.0]
+        for a, b in zip(path, path[1:]):
+            prefix.append(prefix[-1] + self._edge_cost(a, b))
+        smoothed = [path[0]]
+        anchor = 0
+        while anchor < len(path) - 1:
+            for candidate_index in range(len(path) - 1, anchor, -1):
+                direct = self._line_cost(path[anchor], path[candidate_index])
+                original = prefix[candidate_index] - prefix[anchor]
+                if math.isfinite(direct) and direct <= original + 1e-9:
+                    smoothed.append(path[candidate_index])
+                    anchor = candidate_index
+                    break
+        return smoothed, sum(self._line_cost(a, b) for a, b in zip(smoothed, smoothed[1:]))
 
     def route(self, start: tuple[int, int], goal: tuple[int, int]) -> tuple[list[tuple[int, int]], float]:
         """Find an any-angle path with Lazy Theta*.
@@ -249,7 +276,7 @@ class AStarRouter:
             _, current_cost, current = heapq.heappop(queue)
             if current in closed or current_cost != cost.get(current):
                 continue
-            if self._set_vertex(current, parent, cost):
+            if self._set_vertex(current, parent, cost, closed):
                 updated = cost[current]
                 heapq.heappush(queue, (updated + self._heuristic(current, goal), updated, current))
                 continue
@@ -257,7 +284,7 @@ class AStarRouter:
                 path = [current]
                 while path[-1] != start:
                     path.append(parent[path[-1]])
-                return list(reversed(path)), current_cost
+                return self._smooth_path(list(reversed(path)))
             closed.add(current)
             for dr, dc in self.steps:
                 nxt = current[0] + dr, current[1] + dc
@@ -279,6 +306,8 @@ class AStarRouter:
         alternate = object.__new__(AStarRouter)
         alternate.__dict__ = self.__dict__.copy()
         alternate.directional_costs = self.directional_costs.copy()
+        # The original lower bound remains admissible: penalties only raise
+        # edge costs, even if this copy's bound is no longer maximally tight.
         if len(route) > 2:
             rows, cols = zip(*route[1:-1])  # Do not penalize shared endpoints.
             alternate.directional_costs[:, rows, cols] *= factor

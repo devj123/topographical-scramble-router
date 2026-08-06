@@ -28,6 +28,22 @@ def test_deferred_shortcut_keeps_parent_cost_consistent_on_asymmetric_terrain():
     assert cost == pytest.approx(verified_cost)
 
 
+def test_hand_computed_flat_cost_and_smoothed_route():
+    subject = router([[0, 0, 0]], preferred_min_slope=0, preferred_max_slope=30, impassable_slope=50)
+    path, cost = subject.route((0, 0), (0, 2))
+    assert path == [(0, 0), (0, 2)]
+    assert cost == pytest.approx(20.0)
+
+
+def test_smoothing_never_costs_more_than_the_grid_path():
+    subject = router(np.zeros((4, 5)), preferred_min_slope=0, preferred_max_slope=30, impassable_slope=50)
+    raw = [(0, 0), (1, 1), (2, 2), (3, 3), (3, 4)]
+    smooth, smooth_cost = subject._smooth_path(raw)
+    raw_cost = sum(subject._edge_cost(a, b) for a, b in zip(raw, raw[1:]))
+    assert smooth[0] == raw[0] and smooth[-1] == raw[-1]
+    assert smooth_cost <= raw_cost + 1e-9
+
+
 def test_cliff_band_blocks_route():
     subject = router([[0, 0, 1_000, 0, 0]] * 3, preferred_min_slope=0, preferred_max_slope=20, impassable_slope=45)
     path, cost = subject.route((1, 0), (1, 4))

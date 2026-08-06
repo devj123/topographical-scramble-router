@@ -25,7 +25,7 @@ The loader downsamples very large rasters to at most 900 pixels across for inter
 
 ## Cost model
 
-Each cell has eight potential neighbors, with all eight directed cost grids vectorized once when the DEM loads. Edges at or above `--max-slope` are blocked. Deferred Lazy Theta* keeps ordinary relaxation as a consistent O(1) grid-edge update, then checks Bresenham line of sight only when a node is popped and replaces it with a fully costed ancestor shortcut when beneficial. The terrain-specific minimum directed cost per metre supplies a tighter admissible A* heuristic. `--cost-model scramble` uses asymmetric uphill/downhill effort with scramble-band penalties; `--cost-model tobler` uses Tobler's directed hiking-speed function. As with standard Theta*, this efficient any-angle search is an accepted approximation rather than a proof of global optimum on every weighted terrain surface.
+Each cell has eight potential neighbors, with all eight directed cost grids vectorized once when the DEM loads. Edges at or above `--max-slope` are blocked. The search keeps ordinary relaxation as a consistent O(1) grid-edge update, with exactly one parent LOS validation when a node is popped and a closed-neighbor repair if that connection is invalid. Any-angle rendering/export is then produced by greedy, valid, non-worsening shortcutting on the completed route, keeping Bresenham scans out of the expansion hot loop. The terrain-specific minimum directed cost per metre supplies a tighter admissible A* heuristic. `--cost-model scramble` uses asymmetric uphill/downhill effort with scramble-band penalties; `--cost-model tobler` uses Tobler's directed hiking-speed function.
 
 Run the algorithm tests with:
 
