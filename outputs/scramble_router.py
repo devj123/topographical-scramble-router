@@ -215,21 +215,20 @@ class AStarRouter:
         if not (0 <= r < self.rows and 0 <= c < self.cols and self.valid[r, c]):
             raise ValueError(f"{name} must be a valid raster cell")
 
-    def _set_vertex(self, node, parent, cost, closed) -> bool:
-        """Lazy Theta* deferred LOS verification; returns whether its cost changed."""
+    def _set_vertex(self, node, parent, cost) -> bool:
+        """Apply verified, deferred any-angle shortcuts from a node's ancestry."""
+        best_parent, best_cost = parent[node], cost[node]
         ancestor = parent[node]
-        if ancestor == node:
-            return False
-        direct = self._line_cost(ancestor, node)
-        if math.isfinite(direct):
-            new_parent, new_cost = ancestor, cost[ancestor] + direct
-        else:
-            candidates = ((cost[neighbor] + self._edge_cost(neighbor, node), neighbor)
-                          for dr, dc in self.steps
-                          if (neighbor := (node[0] + dr, node[1] + dc)) in closed)
-            new_cost, new_parent = min(candidates, default=(math.inf, node))
-        changed = not math.isclose(new_cost, cost[node], rel_tol=1e-12, abs_tol=1e-9)
-        cost[node], parent[node] = new_cost, new_parent
+        # Normal relaxation records a consistent grid-edge parent/cost pair. At
+        # pop-time we may replace it only with an actual, fully costed LOS path.
+        while ancestor != parent[ancestor]:
+            ancestor = parent[ancestor]
+            line = self._line_cost(ancestor, node)
+            candidate = cost[ancestor] + line
+            if math.isfinite(line) and candidate <= best_cost + 1e-9:
+                best_parent, best_cost = ancestor, candidate
+        changed = not math.isclose(best_cost, cost[node], rel_tol=1e-12, abs_tol=1e-9)
+        cost[node], parent[node] = best_cost, best_parent
         return changed
 
     def route(self, start: tuple[int, int], goal: tuple[int, int]) -> tuple[list[tuple[int, int]], float]:
@@ -250,7 +249,7 @@ class AStarRouter:
             _, current_cost, current = heapq.heappop(queue)
             if current in closed or current_cost != cost.get(current):
                 continue
-            if self._set_vertex(current, parent, cost, closed):
+            if self._set_vertex(current, parent, cost):
                 updated = cost[current]
                 heapq.heappush(queue, (updated + self._heuristic(current, goal), updated, current))
                 continue
@@ -264,14 +263,26 @@ class AStarRouter:
                 nxt = current[0] + dr, current[1] + dc
                 if not (0 <= nxt[0] < self.rows and 0 <= nxt[1] < self.cols and self.valid[nxt]) or nxt in closed:
                     continue
-                # Lazy Theta* defers this parent-to-neighbor LOS check until nxt
-                # is popped; normal relaxation remains O(1).
+                # Keep parent and cost tied to this same verified grid edge. LOS
+                # shortcutting is deferred to _set_vertex when nxt is popped.
                 edge = self._edge_cost(current, nxt)
-                candidate_parent, new_cost = parent[current], current_cost + edge
+                candidate_parent, new_cost = current, current_cost + edge
                 if new_cost < cost.get(nxt, math.inf):
                     cost[nxt], parent[nxt] = new_cost, candidate_parent
                     heapq.heappush(queue, (new_cost + self._heuristic(nxt, goal), new_cost, nxt))
         return [], math.inf
+
+    def penalized_copy(self, route: list[tuple[int, int]], factor: float = 7.0) -> "AStarRouter":
+        """Return a router that discourages reuse of the supplied route cells."""
+        if factor <= 1:
+            raise ValueError("Route penalty factor must exceed 1.")
+        alternate = object.__new__(AStarRouter)
+        alternate.__dict__ = self.__dict__.copy()
+        alternate.directional_costs = self.directional_costs.copy()
+        if len(route) > 2:
+            rows, cols = zip(*route[1:-1])  # Do not penalize shared endpoints.
+            alternate.directional_costs[:, rows, cols] *= factor
+        return alternate
 
 
 def route_stats(terrain: Terrain, path: list[tuple[int, int]]) -> tuple[float, float, float, float]:
@@ -297,6 +308,9 @@ class InteractiveMap:
         self.artists: list = []
         self.figure, self.ax = plt.subplots(figsize=(11, 10))
         self.figure.subplots_adjust(left=0.08, right=0.96, top=0.95, bottom=0.34)
+        self.debounce_timer = self.figure.canvas.new_timer(interval=150)
+        self.debounce_timer.single_shot = True
+        self.debounce_timer.add_callback(self._apply_parameters)
         self._draw_base()
         self._build_controls()
         self.figure.canvas.mpl_connect("button_press_event", self._click)
@@ -333,6 +347,11 @@ class InteractiveMap:
         self.model_buttons.on_clicked(self._parameters_changed)
 
     def _parameters_changed(self, _value) -> None:
+        """Delay costly precomputation until 150ms after the latest UI change."""
+        self.debounce_timer.stop()
+        self.debounce_timer.start()
+
+    def _apply_parameters(self) -> None:
         values = [slider.val for slider in self.sliders]
         try:
             config = RouterConfig(*values, cost_model=self.model_buttons.value_selected)
@@ -349,14 +368,15 @@ class InteractiveMap:
             artist.remove()
         self.artists = self.artists[:1]
 
-    def _route_all_legs(self) -> tuple[list[tuple[int, int]], float]:
+    def _route_all_legs(self, router: AStarRouter | None = None) -> tuple[list[tuple[int, int]], float]:
         if self.start is None:
             return [], 0.0
+        router = router or self.router
         stops = [self.start, *self.waypoints, self.goal]
         complete: list[tuple[int, int]] = []
         total_cost = 0.0
         for a, b in zip(stops, stops[1:]):
-            leg, cost = self.router.route(a, b)
+            leg, cost = router.route(a, b)
             if not leg:
                 return [], math.inf
             complete.extend(leg if not complete else leg[1:])
@@ -378,6 +398,10 @@ class InteractiveMap:
             self.last_path = path
             points = np.asarray(path)
             self.artists.append(self.ax.plot(points[:, 1], points[:, 0], color="magenta", lw=2.3, label="Theta* route")[0])
+            alternate, _ = self._route_all_legs(self.router.penalized_copy(path))
+            if alternate:
+                alternate_points = np.asarray(alternate)
+                self.artists.append(self.ax.plot(alternate_points[:, 1], alternate_points[:, 0], color="cyan", lw=1.3, ls="--", label="penalized alternate")[0])
             distance, gain, loss, hours = route_stats(self.router.terrain, path)
             self._set_title(f"{distance / 1000:.2f} km • +{gain:.0f}/-{loss:.0f} m • Naismith {hours:.1f} h • cost {cost:.0f}")
         else:

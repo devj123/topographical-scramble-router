@@ -20,6 +20,14 @@ def test_theta_star_removes_grid_staircase_on_flat_ground():
     assert math.isfinite(cost)
 
 
+def test_deferred_shortcut_keeps_parent_cost_consistent_on_asymmetric_terrain():
+    subject = router([[0, 5, 10, 15], [0, 5, 10, 15], [0, 5, 10, 15]], preferred_min_slope=0, preferred_max_slope=30, impassable_slope=50)
+    path, cost = subject.route((1, 0), (1, 3))
+    assert path == [(1, 0), (1, 3)]
+    verified_cost = sum(subject._line_cost(a, b) for a, b in zip(path, path[1:]))
+    assert cost == pytest.approx(verified_cost)
+
+
 def test_cliff_band_blocks_route():
     subject = router([[0, 0, 1_000, 0, 0]] * 3, preferred_min_slope=0, preferred_max_slope=20, impassable_slope=45)
     path, cost = subject.route((1, 0), (1, 4))
