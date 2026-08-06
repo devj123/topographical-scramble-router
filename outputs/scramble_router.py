@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,14 +19,18 @@ import numpy as np
 try:
     import matplotlib.pyplot as plt
     from matplotlib.colors import LightSource
+    from matplotlib.widgets import RadioButtons, Slider
 except ImportError:
     plt = None
     LightSource = None
+    RadioButtons = Slider = None
 
 try:
     import rasterio
+    from rasterio.warp import transform as transform_coordinates
 except ImportError:
     rasterio = None
+    transform_coordinates = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,8 @@ class Terrain:
     x_resolution_m: float
     y_resolution_m: float
     name: str = "terrain"
+    transform: object | None = None
+    crs: object | None = None
 
     def __post_init__(self) -> None:
         self.elevation = np.asarray(self.elevation, dtype=float)
@@ -61,6 +68,22 @@ class Terrain:
             raise ValueError("Elevation data must be a two-dimensional array.")
         if self.x_resolution_m <= 0 or self.y_resolution_m <= 0:
             raise ValueError("Pixel resolutions must be positive metres.")
+
+    def to_geojson(self, route: list[tuple[int, int]], output_path: Path) -> None:
+        """Export raster cells as a WGS84 GeoJSON LineString."""
+        if not route:
+            raise ValueError("Cannot export an empty route.")
+        if rasterio is None or self.transform is None or self.crs is None:
+            raise ValueError("GeoJSON export requires a route from a georeferenced GeoTIFF.")
+        rows, cols = zip(*route)
+        x, y = rasterio.transform.xy(self.transform, rows, cols, offset="center")
+        lon, lat = transform_coordinates(self.crs, "EPSG:4326", x, y)
+        feature = {
+            "type": "Feature",
+            "properties": {"source": self.name},
+            "geometry": {"type": "LineString", "coordinates": list(zip(lon, lat))},
+        }
+        output_path.write_text(json.dumps({"type": "FeatureCollection", "features": [feature]}, indent=2), encoding="utf-8")
 
 
 def load_geotiff(path: Path, band: int = 1, max_dimension: int = 900) -> Terrain:
@@ -74,7 +97,7 @@ def load_geotiff(path: Path, band: int = 1, max_dimension: int = 900) -> Terrain
         out_h, out_w = max(2, round(src.height * scale)), max(2, round(src.width * scale))
         elevation = src.read(band, out_shape=(out_h, out_w), masked=True).filled(np.nan).astype(float)
         transform = src.transform * src.transform.scale(src.width / out_w, src.height / out_h)
-        return Terrain(elevation, abs(transform.a), abs(transform.e), path.name)
+        return Terrain(elevation, abs(transform.a), abs(transform.e), path.name, transform, src.crs)
 
 
 def synthetic_mountain(size: int = 320) -> Terrain:
@@ -98,6 +121,18 @@ class AStarRouter:
         self.valid = np.isfinite(terrain.elevation)
         self.step_index = {step: index for index, step in enumerate(self.steps)}
         self.directional_costs = self._precompute_costs()
+        self.heuristic_cost_per_m = self._minimum_cost_per_metre()
+
+    def _minimum_cost_per_metre(self) -> float:
+        """A terrain-specific, admissible lower bound for every routed segment."""
+        ratios = []
+        for index, (dr, dc) in enumerate(self.steps):
+            distance = math.hypot(dc * self.terrain.x_resolution_m, dr * self.terrain.y_resolution_m)
+            values = self.directional_costs[index]
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                ratios.append(float(finite.min() / distance))
+        return min(ratios, default=0.0)
 
     def _precompute_costs(self) -> np.ndarray:
         """Vectorize all eight directed cost surfaces once per fixed DEM."""
@@ -137,10 +172,11 @@ class AStarRouter:
         return math.inf if index is None else float(self.directional_costs[index, a[0], a[1]])
 
     def _heuristic(self, point: tuple[int, int], goal: tuple[int, int]) -> float:
-        # Optimistic base distance (or 0.6 sec/m for Tobler) remains a lower bound.
+        # Every LOS segment is a sum of precomputed edge costs, so the smallest
+        # observed directed cost-per-metre is a safe, tighter lower bound.
         distance = math.hypot((point[0] - goal[0]) * self.terrain.y_resolution_m,
                               (point[1] - goal[1]) * self.terrain.x_resolution_m)
-        return distance * (0.6 if self.config.cost_model == "tobler" else 1.0)
+        return distance * self.heuristic_cost_per_m
 
     @staticmethod
     def _bresenham(a: tuple[int, int], b: tuple[int, int]):
@@ -179,8 +215,31 @@ class AStarRouter:
         if not (0 <= r < self.rows and 0 <= c < self.cols and self.valid[r, c]):
             raise ValueError(f"{name} must be a valid raster cell")
 
+    def _set_vertex(self, node, parent, cost, closed) -> bool:
+        """Lazy Theta* deferred LOS verification; returns whether its cost changed."""
+        ancestor = parent[node]
+        if ancestor == node:
+            return False
+        direct = self._line_cost(ancestor, node)
+        if math.isfinite(direct):
+            new_parent, new_cost = ancestor, cost[ancestor] + direct
+        else:
+            candidates = ((cost[neighbor] + self._edge_cost(neighbor, node), neighbor)
+                          for dr, dc in self.steps
+                          if (neighbor := (node[0] + dr, node[1] + dc)) in closed)
+            new_cost, new_parent = min(candidates, default=(math.inf, node))
+        changed = not math.isclose(new_cost, cost[node], rel_tol=1e-12, abs_tol=1e-9)
+        cost[node], parent[node] = new_cost, new_parent
+        return changed
+
     def route(self, start: tuple[int, int], goal: tuple[int, int]) -> tuple[list[tuple[int, int]], float]:
-        """Find an any-angle path using Theta* parent line-of-sight relaxation."""
+        """Find an any-angle path with Lazy Theta*.
+
+        LOS is checked only when a node is popped, rather than for every
+        neighbor relaxation. As with standard Theta*, this is an efficient
+        any-angle approximation; its closed-list behavior is not a proof of
+        global optimality on every weighted terrain surface.
+        """
         self._valid_point(start, "start")
         self._valid_point(goal, "goal")
         queue = [(self._heuristic(start, goal), 0.0, start)]
@@ -190,6 +249,10 @@ class AStarRouter:
         while queue:
             _, current_cost, current = heapq.heappop(queue)
             if current in closed or current_cost != cost.get(current):
+                continue
+            if self._set_vertex(current, parent, cost, closed):
+                updated = cost[current]
+                heapq.heappush(queue, (updated + self._heuristic(current, goal), updated, current))
                 continue
             if current == goal:
                 path = [current]
@@ -201,15 +264,10 @@ class AStarRouter:
                 nxt = current[0] + dr, current[1] + dc
                 if not (0 <= nxt[0] < self.rows and 0 <= nxt[1] < self.cols and self.valid[nxt]) or nxt in closed:
                     continue
-                # Theta*: try the current node's parent first. A finite raster-line
-                # cost means every sampled edge is traversable, so LOS is clear.
-                ancestor = parent[current]
-                via_ancestor = self._line_cost(ancestor, nxt)
-                if math.isfinite(via_ancestor):
-                    candidate_parent, new_cost = ancestor, cost[ancestor] + via_ancestor
-                else:
-                    edge = self._edge_cost(current, nxt)
-                    candidate_parent, new_cost = current, current_cost + edge
+                # Lazy Theta* defers this parent-to-neighbor LOS check until nxt
+                # is popped; normal relaxation remains O(1).
+                edge = self._edge_cost(current, nxt)
+                candidate_parent, new_cost = parent[current], current_cost + edge
                 if new_cost < cost.get(nxt, math.inf):
                     cost[nxt], parent[nxt] = new_cost, candidate_parent
                     heapq.heappush(queue, (new_cost + self._heuristic(nxt, goal), new_cost, nxt))
@@ -228,16 +286,21 @@ def route_stats(terrain: Terrain, path: list[tuple[int, int]]) -> tuple[float, f
 
 
 class InteractiveMap:
-    def __init__(self, router: AStarRouter, summit: tuple[int, int]) -> None:
-        if plt is None or LightSource is None:
+    def __init__(self, router: AStarRouter, summit: tuple[int, int], export_path: Path | None = None) -> None:
+        if plt is None or LightSource is None or Slider is None or RadioButtons is None:
             raise RuntimeError("matplotlib is required for the interactive map. Install requirements.txt.")
         self.router, self.goal = router, summit
+        self.export_path = export_path
         self.start: tuple[int, int] | None = None
         self.waypoints: list[tuple[int, int]] = []
+        self.last_path: list[tuple[int, int]] = []
         self.artists: list = []
-        self.figure, self.ax = plt.subplots(figsize=(10, 8), layout="constrained")
+        self.figure, self.ax = plt.subplots(figsize=(11, 10))
+        self.figure.subplots_adjust(left=0.08, right=0.96, top=0.95, bottom=0.34)
         self._draw_base()
+        self._build_controls()
         self.figure.canvas.mpl_connect("button_press_event", self._click)
+        self.figure.canvas.mpl_connect("key_press_event", self._key_press)
 
     def _draw_base(self) -> None:
         terrain = self.router.terrain
@@ -246,13 +309,40 @@ class InteractiveMap:
         self.ax.imshow(hillshade, origin="upper")
         self.ax.contour(z, levels=np.linspace(np.nanmin(z), np.nanmax(z), 22), colors="black", linewidths=0.35, alpha=0.45)
         self.artists.append(self.ax.plot(self.goal[1], self.goal[0], "y*", ms=13, mec="black", label="goal")[0])
-        self._set_title("Left-click start • Shift+left-click waypoint • Right-click goal")
+        self._set_title("Left-click start • Shift/middle-click waypoint • Right-click goal • E exports GeoJSON")
         self.ax.set_xlabel("raster column")
         self.ax.set_ylabel("raster row")
         self.ax.legend(loc="upper right")
 
     def _set_title(self, text: str) -> None:
         self.ax.set_title(f"{self.router.terrain.name}: {text}")
+
+    def _build_controls(self) -> None:
+        c = self.router.config
+        positions = [0.275, 0.23, 0.185, 0.14, 0.095]
+        self.sliders = [
+            Slider(self.figure.add_axes([0.14, positions[0], 0.52, 0.022]), "Scramble min (°)", 0, 45, valinit=c.preferred_min_slope),
+            Slider(self.figure.add_axes([0.14, positions[1], 0.52, 0.022]), "Scramble max (°)", 5, 65, valinit=c.preferred_max_slope),
+            Slider(self.figure.add_axes([0.14, positions[2], 0.52, 0.022]), "Slope cutoff (°)", 10, 85, valinit=c.impassable_slope),
+            Slider(self.figure.add_axes([0.14, positions[3], 0.52, 0.022]), "Flat penalty", 0, 25, valinit=c.flat_penalty),
+            Slider(self.figure.add_axes([0.14, positions[4], 0.52, 0.022]), "Steep penalty", 0, 30, valinit=c.steep_penalty),
+        ]
+        self.model_buttons = RadioButtons(self.figure.add_axes([0.75, 0.09, 0.18, 0.19]), ("scramble", "tobler"), active=(0 if c.cost_model == "scramble" else 1))
+        for slider in self.sliders:
+            slider.on_changed(self._parameters_changed)
+        self.model_buttons.on_clicked(self._parameters_changed)
+
+    def _parameters_changed(self, _value) -> None:
+        values = [slider.val for slider in self.sliders]
+        try:
+            config = RouterConfig(*values, cost_model=self.model_buttons.value_selected)
+        except ValueError as exc:
+            self._set_title(str(exc))
+            self.figure.canvas.draw_idle()
+            return
+        self.router = AStarRouter(self.router.terrain, config)
+        self._render_route()
+        self.figure.canvas.draw_idle()
 
     def _clear_route_artists(self) -> None:
         for artist in self.artists[1:]:
@@ -275,8 +365,9 @@ class InteractiveMap:
 
     def _render_route(self) -> None:
         self._clear_route_artists()
+        self.last_path = []
         if self.start is None:
-            self._set_title("Left-click start • Shift+left-click waypoint • Right-click goal")
+            self._set_title("Left-click start • Shift/middle-click waypoint • Right-click goal • E exports GeoJSON")
             return
         self.artists.append(self.ax.plot(self.start[1], self.start[0], "wo", ms=6, mec="black", label="start")[0])
         if self.waypoints:
@@ -284,6 +375,7 @@ class InteractiveMap:
             self.artists.append(self.ax.plot(points[:, 1], points[:, 0], "co", ms=5, mec="black", label="waypoint")[0])
         path, cost = self._route_all_legs()
         if path:
+            self.last_path = path
             points = np.asarray(path)
             self.artists.append(self.ax.plot(points[:, 1], points[:, 0], color="magenta", lw=2.3, label="Theta* route")[0])
             distance, gain, loss, hours = route_stats(self.router.terrain, path)
@@ -301,13 +393,24 @@ class InteractiveMap:
             if event.button == 3:
                 self.goal = point
                 self.artists[0].set_data([point[1]], [point[0]])
-            elif event.button == 1 and event.key == "shift":
+            elif event.button == 2 or (event.button == 1 and "shift" in (event.key or "")):
                 self.waypoints.append(point)
             elif event.button == 1:
                 self.start, self.waypoints = point, []
             else:
                 return
             self._render_route()
+        except ValueError as exc:
+            self._set_title(str(exc))
+        self.figure.canvas.draw_idle()
+
+    def _key_press(self, event) -> None:
+        if (event.key or "").lower() != "e":
+            return
+        try:
+            destination = self.export_path or Path("theta_route.geojson")
+            self.router.terrain.to_geojson(self.last_path, destination)
+            self._set_title(f"Exported {destination}")
         except ValueError as exc:
             self._set_title(str(exc))
         self.figure.canvas.draw_idle()
@@ -324,12 +427,13 @@ def main() -> None:
     parser.add_argument("--scramble-min", type=float, default=12.0, help="Preferred minimum slope in degrees")
     parser.add_argument("--scramble-max", type=float, default=38.0, help="Preferred maximum slope in degrees")
     parser.add_argument("--cost-model", choices=("scramble", "tobler"), default="scramble", help="Directed traversal-cost model")
+    parser.add_argument("--export", type=Path, help="GeoJSON destination used when E is pressed (requires a GeoTIFF)")
     args = parser.parse_args()
     terrain = load_geotiff(args.dem, args.band) if args.dem else synthetic_mountain()
     config = RouterConfig(args.scramble_min, args.scramble_max, args.max_slope, cost_model=args.cost_model)
     router = AStarRouter(terrain, config)
     summit = tuple(np.unravel_index(np.nanargmax(terrain.elevation), terrain.elevation.shape))
-    InteractiveMap(router, summit).show()
+    InteractiveMap(router, summit, args.export).show()
 
 
 if __name__ == "__main__":
