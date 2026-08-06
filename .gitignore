@@ -1,0 +1,7 @@
+# Python environments and bytecode
+outputs/.venv/
+outputs/__pycache__/
+*.py[cod]
+
+# Local editor settings
+.vscode/
