@@ -13,7 +13,7 @@ def router(elevation, **config):
     return AStarRouter(Terrain(np.array(elevation, dtype=float), 10, 10), RouterConfig(**config))
 
 
-def test_theta_star_removes_grid_staircase_on_flat_ground():
+def test_post_search_smoothing_removes_grid_staircase_on_flat_ground():
     subject = router(np.zeros((8, 8)), preferred_min_slope=0, preferred_max_slope=30, impassable_slope=50)
     path, cost = subject.route((0, 0), (7, 5))
     assert path == [(0, 0), (7, 5)]

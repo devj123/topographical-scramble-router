@@ -111,7 +111,7 @@ def synthetic_mountain(size: int = 320) -> Terrain:
 
 
 class AStarRouter:
-    """Theta* router with precomputed directional edge costs."""
+    """8-connected A* router with precomputed directional edge costs."""
 
     steps = tuple((dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc)
 
@@ -180,7 +180,7 @@ class AStarRouter:
 
     @staticmethod
     def _bresenham(a: tuple[int, int], b: tuple[int, int]):
-        """Yield a cell-to-cell raster line (inclusive), suitable for Theta* LOS."""
+        """Yield a cell-to-cell raster line (inclusive) for LOS smoothing."""
         r0, c0 = a
         r1, c1 = b
         dr, dc = abs(r1 - r0), abs(c1 - c0)
@@ -215,25 +215,6 @@ class AStarRouter:
         if not (0 <= r < self.rows and 0 <= c < self.cols and self.valid[r, c]):
             raise ValueError(f"{name} must be a valid raster cell")
 
-    def _set_vertex(self, node, parent, cost, closed) -> bool:
-        """Canonical one-parent lazy validation at pop-time.
-
-        Ordinary relaxation records a fully consistent grid-edge parent/cost
-        pair. This method performs one LOS validation to that parent. If the
-        assumed connection is unavailable, it repairs the node through the
-        cheapest already-closed grid neighbor.
-        """
-        assigned_parent = parent[node]
-        if math.isfinite(self._line_cost(assigned_parent, node)):
-            return False
-        candidates = ((cost[neighbor] + self._edge_cost(neighbor, node), neighbor)
-                      for dr, dc in self.steps
-                      if (neighbor := (node[0] + dr, node[1] + dc)) in closed)
-        best_cost, best_parent = min(candidates, default=(math.inf, node))
-        changed = not math.isclose(best_cost, cost[node], rel_tol=1e-12, abs_tol=1e-9)
-        cost[node], parent[node] = best_cost, best_parent
-        return changed
-
     def _smooth_path(self, path: list[tuple[int, int]]) -> tuple[list[tuple[int, int]], float]:
         """Greedily smooth a completed path without adding work to the search loop.
 
@@ -252,20 +233,14 @@ class AStarRouter:
             for candidate_index in range(len(path) - 1, anchor, -1):
                 direct = self._line_cost(path[anchor], path[candidate_index])
                 original = prefix[candidate_index] - prefix[anchor]
-                if math.isfinite(direct) and direct <= original + 1e-9:
+                if math.isfinite(direct) and direct <= original:
                     smoothed.append(path[candidate_index])
                     anchor = candidate_index
                     break
         return smoothed, sum(self._line_cost(a, b) for a, b in zip(smoothed, smoothed[1:]))
 
     def route(self, start: tuple[int, int], goal: tuple[int, int]) -> tuple[list[tuple[int, int]], float]:
-        """Find an any-angle path with Lazy Theta*.
-
-        LOS is checked only when a node is popped, rather than for every
-        neighbor relaxation. As with standard Theta*, this is an efficient
-        any-angle approximation; its closed-list behavior is not a proof of
-        global optimality on every weighted terrain surface.
-        """
+        """Find a grid-cost-optimal A* path, then smooth it for display/export."""
         self._valid_point(start, "start")
         self._valid_point(goal, "goal")
         queue = [(self._heuristic(start, goal), 0.0, start)]
@@ -275,10 +250,6 @@ class AStarRouter:
         while queue:
             _, current_cost, current = heapq.heappop(queue)
             if current in closed or current_cost != cost.get(current):
-                continue
-            if self._set_vertex(current, parent, cost, closed):
-                updated = cost[current]
-                heapq.heappush(queue, (updated + self._heuristic(current, goal), updated, current))
                 continue
             if current == goal:
                 path = [current]
@@ -290,8 +261,7 @@ class AStarRouter:
                 nxt = current[0] + dr, current[1] + dc
                 if not (0 <= nxt[0] < self.rows and 0 <= nxt[1] < self.cols and self.valid[nxt]) or nxt in closed:
                     continue
-                # Keep parent and cost tied to this same verified grid edge. LOS
-                # shortcutting is deferred to _set_vertex when nxt is popped.
+                # Keep parent and cost tied to this same verified grid edge.
                 edge = self._edge_cost(current, nxt)
                 candidate_parent, new_cost = current, current_cost + edge
                 if new_cost < cost.get(nxt, math.inf):
@@ -426,7 +396,7 @@ class InteractiveMap:
         if path:
             self.last_path = path
             points = np.asarray(path)
-            self.artists.append(self.ax.plot(points[:, 1], points[:, 0], color="magenta", lw=2.3, label="Theta* route")[0])
+            self.artists.append(self.ax.plot(points[:, 1], points[:, 0], color="magenta", lw=2.3, label="smoothed A* route")[0])
             alternate, _ = self._route_all_legs(self.router.penalized_copy(path))
             if alternate:
                 alternate_points = np.asarray(alternate)
@@ -473,7 +443,7 @@ class InteractiveMap:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Explore Theta* terrain routes over a DEM.")
+    parser = argparse.ArgumentParser(description="Explore smoothed A* terrain routes over a DEM.")
     parser.add_argument("dem", nargs="?", type=Path, help="Projected DEM GeoTIFF (optional; synthetic demo if omitted)")
     parser.add_argument("--band", type=int, default=1, help="GeoTIFF band containing elevation")
     parser.add_argument("--max-slope", type=float, default=50.0, help="Slope cutoff in degrees")

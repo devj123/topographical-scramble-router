@@ -1,6 +1,6 @@
 # Topographical Scramble Router
 
-An interactive Python prototype that turns a DEM into an implicit 8-neighbor graph and uses Theta* (any-angle A*) to find a terrain-preference route. It starts with a synthetic mountain so the whole workflow is testable before acquiring an elevation raster.
+An interactive Python prototype that turns a DEM into an implicit 8-neighbor graph, uses A* to find a terrain-cost-optimal grid route, then smooths that finished route with valid, non-worsening line-of-sight shortcuts. It starts with a synthetic mountain so the whole workflow is testable before acquiring an elevation raster.
 
 ## Setup
 
@@ -25,7 +25,7 @@ The loader downsamples very large rasters to at most 900 pixels across for inter
 
 ## Cost model
 
-Each cell has eight potential neighbors, with all eight directed cost grids vectorized once when the DEM loads. Edges at or above `--max-slope` are blocked. The search keeps ordinary relaxation as a consistent O(1) grid-edge update, with exactly one parent LOS validation when a node is popped and a closed-neighbor repair if that connection is invalid. Any-angle rendering/export is then produced by greedy, valid, non-worsening shortcutting on the completed route, keeping Bresenham scans out of the expansion hot loop. The terrain-specific minimum directed cost per metre supplies a tighter admissible A* heuristic. `--cost-model scramble` uses asymmetric uphill/downhill effort with scramble-band penalties; `--cost-model tobler` uses Tobler's directed hiking-speed function.
+Each cell has eight potential neighbors, with all eight directed cost grids vectorized once when the DEM loads. Edges at or above `--max-slope` are blocked. A* uses consistent O(1) grid-edge relaxations. Any-angle rendering/export is then produced by greedy, valid, non-worsening line-of-sight shortcutting on the completed route, keeping Bresenham scans out of the expansion hot loop. This is path smoothing, not Theta*; it cannot explore a separate any-angle corridor during search. The terrain-specific minimum directed cost per metre supplies a tighter admissible A* heuristic. `--cost-model scramble` uses asymmetric uphill/downhill effort with scramble-band penalties; `--cost-model tobler` uses Tobler's directed hiking-speed function.
 
 Run the algorithm tests with:
 
