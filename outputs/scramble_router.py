@@ -221,6 +221,21 @@ class AStarRouter:
         A shortcut is used only when it is traversable and no more expensive than
         the grid subpath it replaces. This leaves A*'s parent/cost bookkeeping
         exact while producing an any-angle, non-worsening display/export route.
+
+        Termination is structural, not numerical: the adjacent grid step
+        (candidate_index == anchor + 1) is always accepted outright, because it
+        is literally the original path and therefore always a valid shortcut.
+        Every anchor is guaranteed to advance by at least one cell per outer-loop
+        iteration regardless of floating-point noise, so this cannot hang. The
+        cost comparison for longer shortcuts uses a relative epsilon (rather than
+        a fixed 1e-9) because `original` is an accumulated prefix sum that can
+        reach magnitudes far larger than a single edge cost on long routes, and a
+        fixed absolute tolerance becomes too tight to absorb the resulting
+        catastrophic-cancellation error at that scale.
+
+        Worst case this is O(n^3) on a long, unobstructed straight path (O(n)
+        anchors x O(n) candidates x O(n) Bresenham cost per candidate). Fine for
+        the demo terrain; profile before routing very long legs on a large DEM.
         """
         if len(path) < 3:
             return path, sum(self._line_cost(a, b) for a, b in zip(path, path[1:]))
@@ -231,9 +246,16 @@ class AStarRouter:
         anchor = 0
         while anchor < len(path) - 1:
             for candidate_index in range(len(path) - 1, anchor, -1):
+                if candidate_index == anchor + 1:
+                    # Always structurally valid: this is the original grid edge,
+                    # so accepting it needs no numeric comparison and guarantees
+                    # anchor advances every iteration.
+                    smoothed.append(path[candidate_index])
+                    anchor = candidate_index
+                    break
                 direct = self._line_cost(path[anchor], path[candidate_index])
                 original = prefix[candidate_index] - prefix[anchor]
-                if math.isfinite(direct) and direct <= original:
+                if math.isfinite(direct) and direct <= original + 1e-9 * max(1.0, original):
                     smoothed.append(path[candidate_index])
                     anchor = candidate_index
                     break
@@ -270,7 +292,8 @@ class AStarRouter:
         return [], math.inf
 
     def penalized_copy(self, route: list[tuple[int, int]], factor: float = 7.0) -> "AStarRouter":
-        """Return a router that discourages reuse of the supplied route cells."""
+        """Return a router that discourages reuse of the supplied route cells,
+        for edges leaving those cells and edges entering them."""
         if factor <= 1:
             raise ValueError("Route penalty factor must exceed 1.")
         alternate = object.__new__(AStarRouter)
@@ -279,8 +302,20 @@ class AStarRouter:
         # The original lower bound remains admissible: penalties only raise
         # edge costs, even if this copy's bound is no longer maximally tight.
         if len(route) > 2:
-            rows, cols = zip(*route[1:-1])  # Do not penalize shared endpoints.
-            alternate.directional_costs[:, rows, cols] *= factor
+            rows, cols = (np.asarray(a) for a in zip(*route[1:-1]))  # Do not penalize shared endpoints.
+            alternate.directional_costs[:, rows, cols] *= factor  # edges leaving a route cell
+            for index, (dr, dc) in enumerate(self.steps):
+                # An edge entering a route cell (r, c) from a neighbor via this
+                # direction is stored at the neighbor's own array position, not
+                # at (r, c). Penalize that source cell too, or the "penalized"
+                # route stays free to walk into the corridor and only pays on
+                # the way out.
+                neighbor_rows, neighbor_cols = rows - dr, cols - dc
+                in_bounds = (
+                    (neighbor_rows >= 0) & (neighbor_rows < self.rows)
+                    & (neighbor_cols >= 0) & (neighbor_cols < self.cols)
+                )
+                alternate.directional_costs[index, neighbor_rows[in_bounds], neighbor_cols[in_bounds]] *= factor
         return alternate
 
 
