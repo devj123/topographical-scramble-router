@@ -1,38 +1,65 @@
-# Topographical Scramble Router
+# Topographical Scramble — PNW Terrain Route Planner
 
-An interactive Python prototype that turns a DEM into an implicit 8-neighbor graph, uses A* to find a terrain-cost-optimal grid route, then smooths that finished route with valid, non-worsening line-of-sight shortcuts. It starts with a synthetic mountain so the whole workflow is testable before acquiring an elevation raster.
+A terrain-aware route planner: given elevation data and two points, it finds not just *a* path but the *right kind* of path — shortest, fastest, gentlest-graded, or steepness-averse — using A* search over a slope-costed graph, with a post-search line-of-sight smoother that turns the jagged 8-connected grid path into a natural any-angle route.
 
-## Setup
+This repo has two things in it, in order of maturity:
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
+1. **`scramble_router.py`** — the original prototype. Synthetic terrain, interactive matplotlib UI, single "scramble" cost model. Fully unit-tested (`tests/test_scramble_router.py`, 12 passing tests). This is where the core algorithm — A*, line-of-sight smoothing, directional (asymmetric ascent/descent) edge costs — was designed and debugged.
+2. **`index.html` + `mount_si_dem.json`** — the real thing. A self-contained web app routing over **real USGS elevation data for Mount Si, WA** (North Bend), with four distinct routing strategies computed from the same terrain-cost engine, rendered on a real topographic basemap. No server, no build step — open `index.html` in a browser, or host it on GitHub Pages.
+
+## Try it
+
+Open `index.html` in any browser. It loads instantly (the terrain data is embedded, not fetched — no CORS/server issues). Click the map once to set a start point, click again to set a destination, and all four routes recompute in milliseconds.
+
+Or host it for free: enable GitHub Pages on this repo (Settings → Pages → deploy from `main` / root) and you get a public URL — see [Publishing on GitHub Pages](#publishing-on-github-pages) below.
+
+## The four strategies
+
+All four share one cost engine (8-connected A* over a slope-costed grid, plus a line-of-sight smoother) and differ only in how each edge is priced:
+
+| Strategy | What it optimizes | Hard slope cutoff |
+|---|---|---|
+| **Shortest** | Pure horizontal distance, ignores terrain | 50° (still can't cross literal cliffs) |
+| **Fastest** | Tobler's hiking-speed function (real hiking-science model of pace vs. grade) | 50° |
+| **Min. elevation gain** | Total ascent | 50° |
+| **Safer** | Grade, penalized quadratically above a preferred threshold | 35° (much tighter) |
+
+On the default Old Si Trail → summit route, the algorithm finds real, meaningful trade-offs: **Shortest** is a straight line that happens to cross a 41° pitch — steep enough that no real trail would take it. **Fastest** is ~50% longer but caps the worst pitch around 22°. **Safer** is longer still but never exceeds ~24°. **Min. elevation gain** converges close to Shortest here — because Mount Si's summit sits atop a nearly continuous ridge, there's very little room to reduce total climbing below the physical floor (destination elevation minus start elevation) without a large detour. That's not a bug; it's a genuine, verified property of this specific climb (see [Honest findings](#honest-findings-and-limitations) below) — and the same algorithm, tested against other point pairs in the same dataset, found routes cutting total gain by 1,000+ ft when a real detour-around-a-dip option existed.
+
+## Data source
+
+`mount_si_dem.json` and the terrain grid embedded in `index.html` are a 40×40 elevation grid (47.483–47.522°N, 121.748–121.717°W) covering the Old Si Trail corridor from the trailhead to the summit, **point-sampled live from the USGS 3DEP Elevation Point Query Service** (`epqs.nationalmap.gov`) — 1-meter-resolution LIDAR-derived elevation, the same authoritative dataset USGS topo maps are built from. Every value in the grid is a real, independently-queryable elevation, not synthetic or interpolated from a cached tile.
+
+A free alternative (`api.open-elevation.com`) was tried first and rejected: it returned large blocks of identical values (effective resolution far coarser than advertised, would have produced visibly blocky, unrealistic terrain). USGS EPQS gives genuinely-varying, high-resolution values and was used instead — worth knowing if you extend this to other mountains and are choosing a data source.
+
+## Honest findings and limitations
+
+- **Grid summit vs. official benchmark:** the grid cell nearest Mount Si's official summit coordinate (per Wikipedia/USGS GNIS, 47.5075°N 121.7400°W) reads 4,112 ft against a listed 4,167 ft — a 55 ft / 1.3% gap, well within normal DEM-vs-survey-benchmark variance.
+- **Elevation gain is close to a physical floor for the default route.** For the trailhead→summit pair, total ascent can't usefully be reduced below (summit elevation − trailhead elevation) because the terrain offers an essentially monotonic ridge climb. The min-gain strategy is correctly implemented — verified independently on other point pairs in the same dataset, where it found dramatically different (lower-gain, longer-distance) routes — it just has little to work with on this specific out-and-back.
+- **Reported slope stats are computed on the full underlying grid resolution**, not the sparse smoothed waypoints, specifically to avoid a long straight "shortest" segment misreporting its net chord slope instead of the true local terrain it crosses.
+- **This is a planning/visualization tool, not a navigation or mountaineering safety system.** Always use current maps, forecasts, local guidance, and your own judgment in the field.
+
+## Publishing on GitHub Pages
+
+Once this is pushed to GitHub (see below), turn it into a live public URL for free:
+
+1. On GitHub, go to your repo → **Settings → Pages**.
+2. Under **Build and deployment**, set **Source** to "Deploy from a branch", branch `main`, folder `/ (root)`.
+3. Save. GitHub gives you a URL like `https://devj123.github.io/<repo-name>/` within a minute or two.
+
+That URL is a real, live, shareable product — no server to maintain, no hosting bill.
+
+## Requirements (Python prototype only)
+
+The web app (`index.html`) needs nothing but a browser. The Python prototype needs:
+
+```
 pip install -r requirements.txt
-python scramble_router.py
+python scramble_router.py          # synthetic demo terrain
+python scramble_router.py dem.tif  # real GeoTIFF DEM, if you have one
+pytest tests/                       # run the test suite
 ```
 
-Left-click to set the start point; shift+left-click (or backend-independent middle-click) appends a waypoint; right-click sets a new goal. The sliders and cost-model chooser reroute live after a 150 ms pause, so dragging controls does not repeatedly recompute the 8-direction cost surface. The solid magenta primary route is accompanied by a thin dashed cyan route that penalizes reuse of its cells, making a useful alternate visible at a glance. The hillshade/contours reveal terrain shape, while the title reports route distance, elevation gain/loss, and an indicative Naismith time estimate.
+## Roadmap
 
-Press `E` to export the last route as WGS84 GeoJSON. GeoTIFFs retain their CRS and affine transform, so a real DEM route can be overlaid in GIS or web-map software. Use `--export C:\data\route.geojson` to choose the destination; otherwise it writes `theta_route.geojson` in the current folder. Synthetic terrain has no geographic reference and cannot be exported.
-
-To use an acquired, projected, metric GeoTIFF DEM:
-
-```powershell
-python scramble_router.py C:\data\shuksan-dem.tif --max-slope 45 --scramble-min 12 --scramble-max 35 --cost-model tobler
-```
-
-The loader downsamples very large rasters to at most 900 pixels across for interactive performance. Use a local projected CRS with horizontal units in metres; geographic degree rasters are rejected because slope calculations would be wrong.
-
-## Cost model
-
-Each cell has eight potential neighbors, with all eight directed cost grids vectorized once when the DEM loads. Edges at or above `--max-slope` are blocked. A* uses consistent O(1) grid-edge relaxations. Any-angle rendering/export is then produced by greedy, valid, non-worsening line-of-sight shortcutting on the completed route, keeping Bresenham scans out of the expansion hot loop. This is path smoothing, not Theta*; it cannot explore a separate any-angle corridor during search. The terrain-specific minimum directed cost per metre supplies a tighter admissible A* heuristic. `--cost-model scramble` uses asymmetric uphill/downhill effort with scramble-band penalties; `--cost-model tobler` uses Tobler's directed hiking-speed function.
-
-Run the algorithm tests with:
-
-```powershell
-pytest tests
-```
-
-## Important limitation
-
-This is a terrain-shape exploration tool, not a route recommendation or safety system. A DEM does not capture rock quality, snow/ice, crevasses, cliffs smaller than the raster resolution, avalanche exposure, access restrictions, changing conditions, or human capability. Do not use its output for on-mountain navigation or safety decisions.
+See [ROADMAP.md](ROADMAP.md) for what's next — turning this from "a working demo" into "a tool real PNW hikers actually use," including the parts that need your own ongoing effort (recruiting testers, collecting feedback, expanding to more mountains) rather than more code.

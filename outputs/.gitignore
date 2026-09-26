@@ -1,0 +1,12 @@
+# Python virtual environment (do NOT commit this -- it's machine-specific and huge)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# pytest
+.pytest_cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db
