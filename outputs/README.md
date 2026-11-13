@@ -41,7 +41,7 @@ A free alternative (`api.open-elevation.com`) was tried first and rejected: it r
 
 ## Publishing on GitHub Pages
 
-Once this is pushed to GitHub (see below), turn it into a live public URL for free:
+Turn this repo into a live public URL for free:
 
 1. On GitHub, go to your repo → **Settings → Pages**.
 2. Under **Build and deployment**, set **Source** to "Deploy from a branch", branch `main`, folder `/ (root)`.
@@ -60,6 +60,3 @@ python scramble_router.py dem.tif  # real GeoTIFF DEM, if you have one
 pytest tests/                       # run the test suite
 ```
 
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for what's next — turning this from "a working demo" into "a tool real PNW hikers actually use," including the parts that need your own ongoing effort (recruiting testers, collecting feedback, expanding to more mountains) rather than more code.
